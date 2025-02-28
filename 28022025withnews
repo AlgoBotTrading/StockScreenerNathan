@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+import warnings
+warnings.filterwarnings('ignore')
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import math
+import requests
+import pickle
+from pathlib import Path
+import importlib.util
+from concurrent.futures import ThreadPoolExecutor
+
+# ***** Debug Flag: Enable Debug Prints *****
+DEBUG_ENABLED = False
+
+# ***** Optional flag to enable/disable placing trades via MetaTrader5 *****
+MT5_TRADING_ENABLED = True
+
+# MetaTrader5 Demo Account Details
+MT5_LOGIN = 62071605
+MT5_PASSWORD = "dER56WD4@"
+MT5_SERVER = "PepperstoneUK-Demo"
+MT5_LEVERAGE = "1:30"    # For reference
+MT5_CURRENCY = "GBP"     # For reference
+MT5_MAGIC = 2000
+
+# Check if MetaTrader5 is installed
+MT5_AVAILABLE = importlib.util.find_spec("MetaTrader5") is not None
+if MT5_AVAILABLE:
+    try:
+        import MetaTrader5 as mt5
+        print("MetaTrader5 module loaded successfully.")
+    except ImportError:
+        MT5_AVAILABLE = False
+        print("MetaTrader5 module found but could not be imported. MT5 trading will be disabled.")
+else:
+    print("MetaTrader5 module not installed. MT5 trading will be disabled.")
+
+# Telegram Configuration – Hardcoded values
+TELEGRAM_TOKEN = '5032878902:AAGzEtzhJ2dzL00FRw6lpcOrdIwUq7sOwTs'
+TELEGRAM_CHAT_ID = '-1002348804535'
+TELEGRAM_DISABLED = False
+
+# Hardcoded Alpha Vantage API Key
+ALPHAVANTAGE_API_KEY = "YHNRDUKXP0ZORMCR"
+
+# Hardcoded Marketaux API Key (backup for news sentiment)
+MARKETAUX_API_KEY = "05l0I57pFvBEdZoUJkosqFF4yAwqenLb84Leucva"
+
+# Hardcoded Financial Modeling Prep API Key (backup for fundamentals)
+FMP_API_KEY = "cfpQSoPWAWIj7RSUer0YeHwiBUg5WOTf"
+
+# Signal tracking configuration (for persistence)
+SIGNALS_FILE = 'scott_signals.pkl'
+
+# Money Management Configuration
+RISK_MODE = "PercentOfBalance"  # Alternatively "PercentOfEquity" or "FixedMoney"
+RISK_PERCENT = 1.0
+FIXED_RISK_AMOUNT = 100.00
+ACCOUNT_BALANCE = 0
+
+# ----- Ticker Conversion Helper Functions -----
+def convert_internal_to_external(ticker):
+    """
+    Convert an internal ticker (e.g., "BT.A.GB") to external format (e.g., "BT-A.L").
+    """
+    if ticker.endswith(".GB"):
+        base = ticker[:-3]  # Remove ".GB"
+        external_base = base.replace(".", "-")
+        return external_base + ".L"
+    return ticker
+
+def convert_external_to_internal(ticker):
+    """
+    Convert an external ticker (e.g., "BT-A.L") to internal format (e.g., "BT.A.GB").
+    """
+    if ticker.endswith(".L"):
+        base = ticker[:-2].rstrip(".")
+        internal_base = base.replace("-", ".")
+        return internal_base + ".GB"
+    return ticker
+
+# ----- Trading & Telegram Utility Functions -----
+def send_telegram_message(message):
+    """Send a message to Telegram."""
+    if TELEGRAM_DISABLED:
+        print("Telegram messaging is disabled. Message not sent.")
+        return True
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("Message sent successfully to Telegram")
+            return True
+        else:
+            print(f"Failed to send message to Telegram: {response.text}")
+            return False
+    except Exception as e:
+        print(f"Error sending message to Telegram: {e}")
+        return False
+
+def load_signals():
+    if not Path(SIGNALS_FILE).exists():
+        print(f"No previous signals file found at {SIGNALS_FILE}.")
+        return []
+    try:
+        with open(SIGNALS_FILE, 'rb') as f:
+            signals = pickle.load(f)
+        print(f"Loaded {len(signals)} previous signals from file.")
+        return signals
+    except Exception as e:
+        print(f"Error loading previous signals: {e}")
+        return []
+
+def save_signals(signals):
+    try:
+        with open(SIGNALS_FILE, 'wb') as f:
+            pickle.dump(signals, f)
+        print(f"Saved {len(signals)} signals to {SIGNALS_FILE}.")
+        return True
+    except Exception as e:
+        print(f"Error saving signals: {e}")
+        return False
+
+def save_signal(signal_data, signals):
+    new_timestamp = datetime.now()
+    new_ticker = signal_data['ticker']
+    new_signal = signal_data['signal']
+    for existing_signal in signals:
+        if existing_signal.get('ticker') == new_ticker and existing_signal.get('signal') == new_signal:
+            ts = existing_signal.get('timestamp')
+            if ts:
+                existing_timestamp = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                if (new_timestamp - existing_timestamp).total_seconds() < 82800:
+                    existing_signal.update(signal_data)
+                    existing_signal['timestamp'] = new_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"Duplicate signal for {new_ticker} within 23 hours. Updated existing signal.")
+                    save_signals(signals)
+                    return signals
+    signal_data['timestamp'] = new_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    signals.append(signal_data)
+    save_signals(signals)
+    print(f"Signal for {signal_data['ticker']} saved successfully. Total signals: {len(signals)}")
+    return signals
+
+def format_telegram_message(stock):
+    """Format a Telegram message with detailed score breakdown."""
+    signal_emoji = {
+        'STRONG BUY': '🟢⬆️',
+        'BUY': '🟢',
+        'NEUTRAL': '⚪',
+        'SELL': '🔴',
+        'STRONG SELL': '🔴⬇️'
+    }
+    breakdown = stock.get('score_breakdown', {})
+    breakdown_text = (
+        f"• Technical: {breakdown.get('technical', 0)}\n"
+        f"• News: {breakdown.get('news', 0)}\n"
+        f"• Fundamentals: {breakdown.get('fundamental', 0)}\n"
+        f"• Total: {breakdown.get('total', 0)}\n"
+    )
+    reasons_text = "".join([f"• {reason}\n" for reason in stock['reasons']])
+    message = f"""
+*TOP RECOMMENDATION: {stock['ticker']} [Scott]*
+
+*SIGNAL:* {signal_emoji.get(stock['signal'], '')} *{stock['signal']}*
+*Conviction Score:* {stock['score']} (out of 100)
+
+*Score Breakdown:*
+{breakdown_text}
+
+*Price Analysis:*
+• Current Price: £{stock['price']:.2f}
+• 24h Change: {stock['price_change']:+.1f}%
+
+*Volume Analysis:*
+• Daily Volume: {stock['volume']:,.0f} shares
+• Avg Volume: {stock['avg_volume']:,.0f} shares
+• Volume Ratio: {stock['volume_ratio']:.1f}x average
+
+*Technical Indicators:*
+• RSI: {stock['rsi']:.1f}
+• ATR: £{stock['atr']:.3f}
+
+*Trading Levels:*
+• Entry: £{stock['price']:.2f}
+• Stop Loss: £{stock['stop_loss']:.4f}
+• Take Profit: £{stock['take_profit']:.4f}
+
+*Key Reasons:*
+{reasons_text}
+*Time horizon:* 2-5 days (swing trade)
+"""
+    return message
+
+def place_trade_mt5(signal, signals):
+    """
+    Place a trade using MetaTrader5 based on the signal.
+    Uses the calculated stop loss and take profit levels.
+    """
+    if not MT5_TRADING_ENABLED:
+        print("MT5 trade placement is disabled via configuration.")
+        return False
+    if not MT5_AVAILABLE:
+        print("MetaTrader5 module not available. Skipping trade placement.")
+        return False
+    if not mt5.initialize():
+        print("MT5 initialization failed. Error code:", mt5.last_error())
+        return False
+    if not mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+        print("MT5 login failed. Error code:", mt5.last_error())
+        mt5.shutdown()
+        return False
+
+    trade_ticker = convert_external_to_internal(signal['ticker'])
+    if not mt5.symbol_select(trade_ticker, True):
+        print(f"Failed to select symbol {trade_ticker} in MetaTrader5.")
+        mt5.shutdown()
+        return False
+
+    tick = mt5.symbol_info_tick(trade_ticker)
+    if tick is None:
+        print(f"Failed to get tick info for {trade_ticker}. Error: {mt5.last_error()}")
+        mt5.shutdown()
+        return False
+
+    if signal.get('signal') in ['BUY', 'STRONG BUY']:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = round(tick.ask, 2)
+    else:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = round(tick.bid, 2)
+
+    account_info = mt5.account_info()
+    if account_info is not None:
+        if RISK_MODE == "PercentOfEquity":
+            balance_to_use = account_info.equity
+        else:
+            balance_to_use = ACCOUNT_BALANCE if ACCOUNT_BALANCE > 0 else account_info.balance
+    else:
+        balance_to_use = ACCOUNT_BALANCE
+
+    volume = calculate_lot_size(signal['ticker'], price, float(signal.get('stop_loss')),
+                                  balance_to_use, RISK_MODE, RISK_PERCENT, FIXED_RISK_AMOUNT)
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": trade_ticker,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "sl": float(signal.get('stop_loss')),
+        "tp": float(signal.get('take_profit')),
+        "deviation": 20,
+        "magic": MT5_MAGIC,
+        "comment": "AutoTrade-Scott",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+    print("Trade Request:", request)
+    try:
+        result = mt5.order_send(request)
+    except Exception as e:
+        print("Exception during mt5.order_send:", e)
+        mt5.shutdown()
+        return False
+
+    if result is None or not hasattr(result, "retcode"):
+        print("MT5 order_send returned an invalid result. Error:", mt5.last_error())
+        mt5.shutdown()
+        return False
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print("Failed to place order via MetaTrader5. Retcode:", result.retcode)
+        print("Result:", result)
+        mt5.shutdown()
+        return False
+    else:
+        print("Order placed successfully via MetaTrader5:", result)
+        for s in signals:
+            if s.get('ticker') == signal.get('ticker') and s.get('timestamp') == signal.get('timestamp'):
+                s['mt5_order_placed'] = True
+                s['mt5_order_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                break
+        save_signals(signals)
+        mt5.shutdown()
+        return True
+
+# ----- COMPANY INFO: Full FTSE 100 Ticker List -----
+COMPANY_INFO = {
+    "III.GB": {"description": "3i Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ADM.GB": {"description": "Admiral Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "AAL.GB": {"description": "Anglo American", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ANTO.GB": {"description": "Antofagasta", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "AHT.GB": {"description": "Ashtead Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ABF.GB": {"description": "Associated British Foods", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "AZN.GB": {"description": "AstraZeneca", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "AUTO.GB": {"description": "Auto Trader Group PLC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "AV.GB": {"description": "Aviva", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "BA.GB": {"description": "BAE Systems", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "BARC.GB": {"description": "Barclays", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "BKG.GB": {"description": "Berkeley Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "BP.GB": {"description": "BP PLC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "BATS.GB": {"description": "British American Tobacco", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "BLND.GB": {"description": "British Land", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "BT.A.GB": {"description": "BT Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "BNZL.GB": {"description": "Bunzl", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "BRBY.GB": {"description": "Burberry Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "CNA.GB": {"description": "Centrica", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "CCH.GB": {"description": "Coca-Cola HBC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "CPG.GB": {"description": "Compass Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "CRDA.GB": {"description": "Croda", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "DCC.GB": {"description": "DCC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "DLG.GB": {"description": "Direct Line Insurance", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "EVR.GB": {"description": "Evraz", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "EXPN.GB": {"description": "Experian", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "FERG.GB": {"description": "Ferguson", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "FLTR.GB": {"description": "Flutter Entertainment", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "GFS.GB": {"description": "G4S", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "GLEN.GB": {"description": "Glencore", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "GSK.GB": {"description": "GSK (GlaxoSmithKline)", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "HLMA.GB": {"description": "Halma", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "HIK.GB": {"description": "Hikma Pharmaceuticals", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "HSBA.GB": {"description": "HSBC Holdings", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "IMB.GB": {"description": "Imperial Brands", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "INF.GB": {"description": "Informa", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "IHG.GB": {"description": "InterContinental Hotels", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ITRK.GB": {"description": "Intertek Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ITV.GB": {"description": "ITV", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "JE/.GB": {"description": "Just Eat Takeaway", "contract_size": 1, "volume_step": 1, "minimal_volume": 1},
+    "KGF.GB": {"description": "Kingfisher", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "LAND.GB": {"description": "Land Securities", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "LGEN.GB": {"description": "Legal & General", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "LLOY.GB": {"description": "Lloyds Banking Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "LSE.GB": {"description": "London Stock Exchange", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "MNG.GB": {"description": "M&G", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "MRO.GB": {"description": "Melrose Industries", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "MNDI.GB": {"description": "Mondi", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "NG.GB": {"description": "National Grid", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "NWG.GB": {"description": "NatWest Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "NXT.GB": {"description": "Next PLC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "OCDO.GB": {"description": "Ocado Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "PHNX.GB": {"description": "Phoenix Group Holdings", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "POLY.GB": {"description": "Polymetal International", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "PRU.GB": {"description": "Prudential", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "PSN.GB": {"description": "Persimmon", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "PSON.GB": {"description": "Pearson", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "RB.GB": {"description": "Reckitt Benckiser Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "REL.GB": {"description": "RELX", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "RMV.GB": {"description": "Rightmove", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "RIO.GB": {"description": "Rio Tinto", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "RR..GB": {"description": "Rolls-Royce Holdings", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 50},
+    "RBS.GB": {"description": "NatWest Group (RBS)", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "RDSA.GB": {"description": "Royal Dutch Shell A", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "RDSB.GB": {"description": "Royal Dutch Shell B", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "SGE.GB": {"description": "Sage Group", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SDR.GB": {"description": "Schroders", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SGRO.GB": {"description": "Segro", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SVT.GB": {"description": "Severn Trent", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SKG.GB": {"description": "Smurfit Kappa", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SMT.GB": {"description": "Scottish Mortgage Investment Trust", "contract_size": 1, "volume_step": 1, "minimal_volume": 1},
+    "SPX.GB": {"description": "Spirax-Sarco Engineering", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SSON.GB": {"description": "Smithson Investment Trust", "contract_size": 1, "volume_step": 1, "minimal_volume": 1},
+    "STJ.GB": {"description": "St James's Place", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SMDS.GB": {"description": "Smith, DS", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "SN.GB": {"description": "Smith & Nephew", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "TSCO.GB": {"description": "Tesco", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "TW.GB": {"description": "Taylor Wimpey", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "ULVR.GB": {"description": "Unilever", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "UU.GB": {"description": "United Utilities", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "VOD.GB": {"description": "Vodafone", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 10},
+    "WTB.GB": {"description": "Whitbread", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1},
+    "WPP.GB": {"description": "WPP PLC", "contract_size": 1, "volume_step": 0.1, "minimal_volume": 1}
+}
+
+def load_full_company_info():
+    return COMPANY_INFO
+
+def get_ftse100_stocks():
+    full_info = load_full_company_info()
+    return [convert_internal_to_external(ticker) for ticker in full_info.keys()]
+
+def calculate_lot_size(ticker, price, stop_loss_price, balance, risk_mode, risk_percent, fixed_risk_amount):
+    if price <= 0 or stop_loss_price is None:
+        return 0.0
+    if risk_mode == "PercentOfBalance":
+        balance = balance if balance > 0 else 0
+        risk_amount = balance * (risk_percent / 100)
+    elif risk_mode == "PercentOfEquity":
+        balance = balance if balance > 0 else 0
+        risk_amount = balance * (risk_percent / 100)
+    elif risk_mode == "FixedMoney":
+        risk_amount = fixed_risk_amount
+    else:
+        balance = balance if balance > 0 else 0
+        risk_amount = balance * (risk_percent / 100)
+    stop_distance = abs(price - stop_loss_price)
+    if stop_distance == 0:
+        return 0.0
+    internal = convert_external_to_internal(ticker)
+    if internal in COMPANY_INFO:
+        contract_size = COMPANY_INFO[internal]['contract_size']
+        min_vol = COMPANY_INFO[internal]['minimal_volume']
+        volume = risk_amount / (stop_distance * contract_size)
+        volume = max(volume, min_vol)
+        step = COMPANY_INFO[internal]['volume_step']
+        volume = math.floor(volume / step) * step
+        return round(volume, 2)
+    else:
+        return 0.0
+
+def get_market_data(ticker, period='3mo', interval='1d'):
+    try:
+        hist = yf.Ticker(ticker).history(period=period, interval=interval)
+        if hist is not None and len(hist) > 0:
+            if ticker.endswith(".L"):
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    if col in hist.columns:
+                        hist[col] = hist[col] / 100.0
+                if 'Adj Close' in hist.columns:
+                    hist['Adj Close'] = hist['Adj Close'] / 100.0
+            return hist
+        else:
+            print(f"No data available for {ticker}")
+            return None
+    except Exception as e:
+        print(f"Error fetching market data for {ticker}: {e}")
+        return None
+
+def calculate_rsi(data, periods=14):
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=periods).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=periods).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(data):
+    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return macd, signal
+
+def calculate_bollinger_bands(data, window=20):
+    sma = data['Close'].rolling(window=window).mean()
+    std = data['Close'].rolling(window=window).std()
+    upper = sma + (std * 2)
+    lower = sma - (std * 2)
+    return upper, sma, lower
+
+def calculate_atr(data, period=14):
+    high_low = data['High'] - data['Low']
+    high_close = abs(data['High'] - data['Close'].shift())
+    low_close = abs(data['Low'] - data['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    return true_range.rolling(window=period).mean()
+
+def analyze_volume_profile(data):
+    try:
+        avg_vol = data['Volume'].rolling(window=20).mean().iloc[-1]
+        return {"avg_volume": avg_vol}
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"Error analyzing volume profile: {e}")
+        return None
+
+def get_ftse100_stocks():
+    """
+    Return the complete list of FTSE 100 stocks in external format (e.g., 'XYZ.L').
+    """
+    return [convert_internal_to_external(ticker) for ticker in COMPANY_INFO.keys()]
+
+def get_news_sentiment(ticker):
+    """
+    Fetch news sentiment for the given stock using Alpha Vantage's News Sentiment API.
+    If no sentiment is returned, fall back to Marketaux API.
+    Returns an average sentiment score between -1 and +1.
+    """
+    symbol = ticker
+    if symbol.endswith(".L"):
+        symbol = symbol[:-2]
+        symbol = symbol.replace("-", ".")
+    # Try Alpha Vantage
+    try:
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&apikey={ALPHAVANTAGE_API_KEY}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "feed" in data:
+                sentiments = []
+                for article in data.get("feed", []):
+                    score = article.get("overall_sentiment_score")
+                    if score is not None:
+                        try:
+                            score = float(score)
+                        except:
+                            score = None
+                    if score is None and "ticker_sentiment" in article:
+                        for tic in article["ticker_sentiment"]:
+                            if tic.get("ticker") and tic.get("ticker").upper() == symbol.upper():
+                                ts_score = tic.get("ticker_sentiment_score")
+                                if ts_score is not None:
+                                    try:
+                                        score = float(ts_score)
+                                    except:
+                                        score = None
+                                break
+                    if score is not None:
+                        sentiments.append(score)
+                avg_sent = sum(sentiments) / len(sentiments) if sentiments else 0.0
+                if avg_sent != 0.0:
+                    return avg_sent
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"Alpha Vantage news sentiment error for {ticker}: {e}")
+    # Fallback: Marketaux API
+    try:
+        url = "https://api.marketaux.com/v1/news/all"
+        params = {"symbols": ticker, "api_token": MARKETAUX_API_KEY, "limit": 3}
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "data" in data:
+                sentiments = []
+                for article in data["data"]:
+                    for entity in article.get("entities", []):
+                        if entity.get("symbol") and entity.get("symbol").upper() == ticker.upper():
+                            score = entity.get("sentiment_score")
+                            if score is not None:
+                                try:
+                                    score = float(score)
+                                    sentiments.append(score)
+                                except:
+                                    continue
+                avg_sent = sum(sentiments) / len(sentiments) if sentiments else 0.0
+                return avg_sent
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"Marketaux news sentiment error for {ticker}: {e}")
+    return 0.0
+
+def get_fundamental_data(ticker):
+    """
+    Fetch fundamental data for the given stock using Alpha Vantage's OVERVIEW API.
+    If that fails, fall back to Financial Modeling Prep API.
+    Returns a dict with keys 'pe' (P/E ratio) and 'profitable' (True if EPS >= 0).
+    """
+    symbol = ticker
+    if symbol.endswith(".L"):
+        symbol = symbol[:-2]
+        symbol = symbol.replace("-", ".")
+    # Try Alpha Vantage
+    try:
+        url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHAVANTAGE_API_KEY}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "Symbol" in data:
+                fundamentals = {}
+                try:
+                    eps_str = data.get("EPS")
+                    pe_str = data.get("PERatio")
+                    eps = float(eps_str) if eps_str not in [None, "None", ""] else None
+                    pe = float(pe_str) if pe_str not in [None, "None", ""] else None
+                    fundamentals['pe'] = pe
+                    fundamentals['profitable'] = None if eps is None else (False if eps < 0 else True)
+                    return fundamentals
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        print(f"Error processing Alpha Vantage fundamentals for {ticker}: {e}")
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"Alpha Vantage fundamental error for {ticker}: {e}")
+    # Fallback: Financial Modeling Prep API
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/profile/{symbol}?apikey={FMP_API_KEY}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                profile = data[0]
+                fundamentals = {}
+                pe = profile.get("priceEarningsRatio")
+                eps = profile.get("eps")
+                try:
+                    pe = float(pe) if pe is not None else None
+                except:
+                    pe = None
+                try:
+                    eps = float(eps) if eps is not None else None
+                except:
+                    eps = None
+                fundamentals['pe'] = pe
+                fundamentals['profitable'] = None if eps is None else (False if eps < 0 else True)
+                return fundamentals
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"Financial Modeling Prep fundamental error for {ticker}: {e}")
+    return None
+
+def analyze_stock(ticker):
+    """
+    Analyze the given stock by combining technical, news sentiment, and fundamental data.
+    Returns a dictionary with the trade signal, score breakdown, and details.
+    """
+    hist = get_market_data(ticker, period='3mo', interval='1d')
+    if hist is None or len(hist) < 20:
+        return None
+    try:
+        data = hist.copy()
+        data['RSI'] = calculate_rsi(data)
+        data['MACD'], data['Signal'] = calculate_macd(data)
+        data['BB_Upper'], data['BB_Middle'], data['BB_Lower'] = calculate_bollinger_bands(data)
+        data['ATR'] = calculate_atr(data)
+        
+        current_price = data['Close'].iloc[-1]
+        prev_price = data['Close'].iloc[-2]
+        price_change = ((current_price - prev_price) / prev_price) * 100
+        
+        volume_profile = analyze_volume_profile(data)
+        avg_volume = volume_profile['avg_volume'] if volume_profile else data['Volume'].mean()
+        current_volume = data['Volume'].iloc[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume != 0 else 1.0
+        
+        data['SMA20'] = data['Close'].rolling(window=20).mean()
+        data['SMA50'] = data['Close'].rolling(window=50).mean()
+        
+        reasons = []
+        
+        # --- Technical Score ---
+        technical_score = 0
+        rsi = data['RSI'].iloc[-1]
+        if rsi < 30:
+            technical_score += 20
+            reasons.append(f"Oversold RSI: {rsi:.1f}")
+        elif rsi > 70:
+            technical_score -= 20
+            reasons.append(f"Overbought RSI: {rsi:.1f}")
+        
+        macd_val = data['MACD'].iloc[-1]
+        macd_signal = data['Signal'].iloc[-1]
+        if macd_val > macd_signal:
+            technical_score += 15
+            reasons.append("MACD bullish crossover")
+        else:
+            technical_score -= 15
+            reasons.append("MACD bearish crossover")
+        
+        if volume_ratio > 1.5:
+            technical_score += 10
+            reasons.append(f"High volume: {volume_ratio:.1f}x average")
+        
+        sma20 = data['SMA20'].iloc[-1]
+        sma50 = data['SMA50'].iloc[-1]
+        if current_price > sma20 and sma20 > sma50:
+            technical_score += 15
+            reasons.append("Strong uptrend (Price > SMA20 > SMA50)")
+        elif current_price < sma20 and sma20 < sma50:
+            technical_score -= 15
+            reasons.append("Strong downtrend (Price < SMA20 < SMA50)")
+        
+        if price_change > 2:
+            technical_score += 10
+            reasons.append(f"Momentum: +{price_change:.1f}% in last day")
+        elif price_change < -2:
+            technical_score -= 10
+            reasons.append(f"Momentum: {price_change:.1f}% in last day")
+        
+        # --- News Sentiment Score ---
+        news_score = 0
+        sentiment_score = get_news_sentiment(ticker)
+        if sentiment_score > 0.35:
+            news_score += 20
+            reasons.append(f"Highly positive news sentiment: {sentiment_score:.2f}")
+        elif sentiment_score > 0.2:
+            news_score += 10
+            reasons.append(f"Positive news sentiment: {sentiment_score:.2f}")
+        elif sentiment_score < -0.35:
+            news_score -= 20
+            reasons.append(f"Highly negative news sentiment: {sentiment_score:.2f}")
+        elif sentiment_score < -0.2:
+            news_score -= 10
+            reasons.append(f"Negative news sentiment: {sentiment_score:.2f}")
+        
+        # --- Fundamental Score ---
+        fundamental_score = 0
+        fundamentals = get_fundamental_data(ticker)
+        if fundamentals:
+            if fundamentals.get('profitable') is False:
+                fundamental_score -= 10
+                reasons.append("Negative earnings (EPS)")
+            pe_val = fundamentals.get('pe')
+            if pe_val is not None:
+                if pe_val < 15:
+                    fundamental_score += 5
+                    reasons.append(f"Low P/E ratio: {pe_val:.1f}")
+                elif pe_val > 30:
+                    fundamental_score -= 5
+                    reasons.append(f"High P/E ratio: {pe_val:.1f}")
+        
+        # Total score breakdown
+        total_score = technical_score + news_score + fundamental_score
+        score_breakdown = {
+            "technical": technical_score,
+            "news": news_score,
+            "fundamental": fundamental_score,
+            "total": total_score
+        }
+        
+        # Determine final signal and calculate SL & TP using ATR
+        atr = data['ATR'].iloc[-1]
+        if atr == 0 or np.isnan(atr):
+            atr = 0.01 * current_price
+        if total_score > 0:
+            stop_loss = round(current_price - 1.5 * atr, 4)
+            take_profit = round(current_price + 3 * atr, 4)
+            final_signal = "STRONG BUY" if total_score > 50 else "BUY"
+        elif total_score < 0:
+            stop_loss = round(current_price + 1.5 * atr, 4)
+            take_profit = round(current_price - 3 * atr, 4)
+            final_signal = "STRONG SELL" if total_score < -50 else "SELL"
+        else:
+            stop_loss = round(current_price - 1.5 * atr, 4)
+            take_profit = round(current_price + 3 * atr, 4)
+            final_signal = "NEUTRAL"
+        
+        return {
+            'ticker': ticker,
+            'signal': final_signal,
+            'score': abs(int(total_score)),
+            'score_breakdown': score_breakdown,
+            'price': current_price,
+            'volume': current_volume,
+            'avg_volume': avg_volume,
+            'volume_ratio': volume_ratio,
+            'rsi': rsi,
+            'price_change': price_change,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'reasons': reasons,
+            'atr': data['ATR'].iloc[-1]
+        }
+    except Exception as e:
+        print(f"Error analyzing {ticker}: {e}")
+        return None
+
+def main():
+    print("\n=== FTSE 100 Stock Scanner [Scott Version] ===")
+    print(f"Running at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    signals = load_signals()
+    stocks = get_ftse100_stocks()
+    best_opportunity = None
+    highest_score = 0
+    
+    for ticker in stocks:
+        print(f"Analyzing {ticker}...")
+        result = analyze_stock(ticker)
+        if result and abs(result['score']) > highest_score:
+            highest_score = abs(result['score'])
+            best_opportunity = result
+            print(f"New best opportunity found: {ticker} (Score: {result['score']})")
+    
+    if not best_opportunity:
+        print("\nNo valid trading opportunities found.")
+        return signals
+    
+    stock = best_opportunity
+    print("\n" + "=" * 60)
+    print(f"TOP RECOMMENDATION: {stock['ticker']}")
+    print("=" * 60)
+    print(f"\nSIGNAL: {stock['signal']}")
+    print(f"Conviction Score: {stock['score']}/100")
+    print("\nScore Breakdown:")
+    breakdown = stock.get('score_breakdown', {})
+    print(f"• Technical: {breakdown.get('technical', 0)}")
+    print(f"• News: {breakdown.get('news', 0)}")
+    print(f"• Fundamentals: {breakdown.get('fundamental', 0)}")
+    print(f"• Total: {breakdown.get('total', 0)}")
+    print("\nPrice Analysis:")
+    print(f"Current Price: £{stock['price']:.2f}")
+    print(f"24h Change: {stock['price_change']:+.1f}%")
+    print("\nVolume Analysis:")
+    print(f"Daily Volume: {stock['volume']:,.0f} shares")
+    print(f"Avg Volume: {stock['avg_volume']:,.0f} shares")
+    print(f"Volume Ratio: {stock['volume_ratio']:.1f}x average")
+    print("\nTechnical Indicators:")
+    print(f"RSI: {stock['rsi']:.1f}")
+    print(f"ATR: £{stock['atr']:.3f}")
+    print("\nTrading Levels:")
+    print(f"Entry: £{stock['price']:.2f}")
+    print(f"Stop Loss: £{stock['stop_loss']:.4f} ({((stock['stop_loss'] - stock['price'])/stock['price']*100):+.1f}%)")
+    print(f"Take Profit: £{stock['take_profit']:.4f} ({((stock['take_profit'] - stock['price'])/stock['price']*100):+.1f}%)")
+    
+    risk = abs(stock['price'] - stock['stop_loss'])
+    reward = abs(stock['take_profit'] - stock['price'])
+    rr_ratio = reward / risk if risk != 0 else 0
+    print(f"\nRisk/Reward Ratio: {rr_ratio:.1f}")
+    
+    message = format_telegram_message(stock)
+    print("\nFormatted Telegram Message:")
+    print(message)
+    
+    print("\nAttempting to place trade via MetaTrader5...")
+    if MT5_TRADING_ENABLED:
+        if MT5_AVAILABLE:
+            if place_trade_mt5(stock, signals):
+                print("Trade placed successfully via MetaTrader5.")
+            else:
+                print("Failed to place trade via MetaTrader5.")
+        else:
+            print("MetaTrader5 is not available. Skipping trade placement.")
+    else:
+        print("MT5 trade placement is disabled by configuration.")
+    
+    save_signal(stock, signals)
+    send_telegram_message(message)
+    return signals
+
+if __name__ == "__main__":
+    main()
